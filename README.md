@@ -250,10 +250,6 @@ Run the whole thing without touching the Internet Archive:
   <https://github.com/oduwsdl/storygraph-toolkit>
   Branch with the stories changes: <https://github.com/sleong05/storygraph-toolkit>
   *(still needs to be merged in)*
-  ```bash
-  git clone https://github.com/oduwsdl/storygraph-toolkit.git
-  cd storygraph-toolkit/ && pip install . && cd .. && rm -rf storygraph-toolkit/
-  ```
 - **`ia_uploader.py`** — Stage 3, standalone script. Needs
   [`internetarchive`](https://archive.org/developers/internetarchive/)
   (`pip install internetarchive`, then `ia configure`).
