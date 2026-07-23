@@ -524,38 +524,6 @@ Every article's `leaning` is one of `left`, `center`, `right`.
 | Default bucket — Day / Week / Month / Year | 2 h / 1 day / 1 day / 2 weeks |
 | Threshold top-N — Day / Week / Month·Year | 3 / 4 / 5 |
 
----
-
-## Gotchas
-
-- **`published` timestamp format is inconsistent across the docs.** Stage 1 (embed)
-  emits ISO 8601 (`2026-01-01T12:00:00Z`); the Stage 2 (cluster) example shows an
-  RFC-822-style string (`Wed, 01 Jan 2026 18:40:36 +0000`); the frontend expects ISO
-  8601. Confirm what the cluster step actually writes and what the frontend parser
-  accepts, and normalize if needed — a mismatch here silently breaks bucketing.
-- **Two data sources, one frontend.** The Stories timeline (this pipeline) and the
-  similarity graph are independent. Don't assume a change to one affects the other.
-- **The port-5000 server is dev-only.** Production reads flat files from the Internet
-  Archive; the local server only mimics that for development. Don't ship it as a
-  runtime dependency.
-- **Week dates normalize to Monday.** `sgtk cluster ... weeks` and the frontend both
-  key weekly windows by the Monday of the ISO week; pass/expect that date, not an
-  arbitrary day in the week.
-- **`ia_uploader.py` reads from `./tmp`, not `./data/timeline`.** Its `SRC_BASE` is
-  hardcoded to `./tmp`, so run `sgtk cluster` with `-p ./tmp` (or move the output)
-  before uploading, or every file is silently skipped as "missing."
-- **The uploader's date range is hardcoded.** It always runs `2017-08-08 → 2026-04-30`
-  for the given interval unless you edit the literals in `__main__`. There is no CLI
-  date argument.
-- **Singular vs. plural `interval` everywhere.** The uploader CLI and the uploaded
-  filenames use the singular (`day`, `stories-day-…`), while the on-disk directories,
-  `sgtk cluster`, and the frontend API routes use the plural (`days/`,
-  `/api/timeline/days/…`). Mixing them up is the most likely source of "file not found."
-- **Files are renamed on upload.** On disk a file is `2026-01-01.json.gz`; in the
-  Internet Archive it is `stories-day-2026-01-01.json.gz`. Anything fetching from the
-  Archive must use the `stories-{interval}-…` name.
-
----
 
 ## Repositories
 
