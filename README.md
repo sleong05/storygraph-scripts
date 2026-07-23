@@ -1,542 +1,263 @@
 # StoryGraph Data Pipeline
 
-End-to-end documentation for how raw news articles become the clustered, filtered
-story timelines shown in the StoryGraph frontend.
+How raw news articles become the clustered story timelines shown on the StoryGraph
+frontend.
 
-This pipeline takes raw news article data from the StoryGraph archive and produces
-structured, clustered JSON files ready for the frontend to consume. It runs in two
-processing stages — **embed** (fetch articles and generate vector embeddings) and
-**cluster** (group articles into stories and produce the final flat files) — after
-which the output is **uploaded to the Internet Archive** and **pulled back down by
-the frontend**, which filters, orders, and displays it.
+Articles are pulled from the StoryGraph archive, embedded, clustered into stories,
+uploaded to the Internet Archive, and pulled back down by the frontend, which filters,
+orders, and draws them.
 
-If you are new to the project, read this file top to bottom. It links out to the two
-component repositories for anything deeper.
+This is the **overview** — it covers how the pieces fit together and the conventions
+that live *between* them. Each component has its own README with the full detail; see
+[Repositories](#repositories).
 
 ---
 
 ## Contents
 
-- [Architecture at a glance](#architecture-at-a-glance)
+- [Architecture](#architecture)
 - [Scope: which pipeline this documents](#scope-which-pipeline-this-documents)
 - [Stage 1 — Embed](#stage-1--embed)
 - [Stage 2 — Cluster](#stage-2--cluster)
 - [Stage 3 — Upload to the Internet Archive](#stage-3--upload-to-the-internet-archive)
-- [Stage 4 — Frontend: fetch, filter, display](#stage-4--frontend-fetch-filter-display)
+- [Stage 4 — Frontend](#stage-4--frontend)
+- [Running on the HPC cluster (`2017_to_2026/`)](#running-on-the-hpc-cluster-2017_to_2026)
 - [Local development](#local-development)
-- [Reference tables](#reference-tables)
 - [Gotchas](#gotchas)
 - [Repositories](#repositories)
 
 ---
 
-## Architecture at a glance
+## Architecture
 
 ```
-   ┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-   │  sgtk embed  │ ──▶ │ sgtk cluster │ ──▶ │ upload script│ ──▶ │   Internet   │
-   │              │     │              │     │              │     │    Archive    │
-   │ fetch + emb- │     │  HDBSCAN +   │     │  push flat   │     │  (public data │
-   │  ed articles │     │  flat files  │     │    files     │     │    store)     │
-   └──────────────┘     └──────────────┘     └──────────────┘     └───────┬──────┘
-        │                     │                                           │
-   .json.gz per day    data/timeline/{interval}/{date}.json.gz           │
-                                                                          ▼
-                                                                  ┌──────────────┐
-                                                                  │   Frontend   │
-                                                                  │  (React/D3)  │
-                                                                  │              │
-                                                                  │ fetch ▶ filter│
-                                                                  │  ▶ order ▶ draw│
-                                                                  └──────────────┘
+  sgtk embed  ──▶  sgtk cluster  ──▶  ia_uploader.py  ──▶  Internet Archive  ──▶  Frontend
+      │                 │                    │                     │                  │
+  embeddings      flat story files      publish + rename      public storage    filter ▶ order ▶ draw
+  1 file/day      1 file/interval        stories-*.json.gz                          (React + D3)
 ```
 
-The whole thing is one directional flow. Nothing writes back upstream: the toolkit
-produces files, the upload step publishes them, and the frontend is a read-only
-consumer.
+One directional flow — nothing writes back upstream. The toolkit produces files, the
+uploader publishes them, the frontend is a read-only consumer.
 
 ---
 
 ## Scope: which pipeline this documents
 
-The StoryGraph project actually ships **two** tools on the same React frontend, fed
-by **two independent data paths**:
+Two tools share the same React frontend, fed by **two independent data paths**:
 
-| Tool | What it shows | Data source | Covered here? |
-|------|---------------|-------------|---------------|
-| **Stories** (timeline) | How stories / topics / entities rise and fall over a day, week, month, or year | Flat JSON files from the `sgtk embed` + `sgtk cluster` pipeline, published to the Internet Archive | ✅ **Yes — this is the pipeline documented below** |
-| **StoryGraph** (similarity graph) | A news-similarity network recomputed every 10 minutes | A **separate** graph processor that writes `graphs-*.jsonl.gz` + byte-offset index files to the Internet Archive | ➖ Mentioned for context only |
+| Tool | Shows | Fed by | Here? |
+|------|-------|--------|-------|
+| **Stories** (timeline) | How stories / topics / entities rise and fall over a day, week, month, or year | `sgtk embed` + `sgtk cluster` → Internet Archive | ✅ documented below |
+| **StoryGraph** (similarity graph) | News-similarity network, recomputed every 10 min | A separate graph processor writing `graphs-*.jsonl.gz` + byte-offset indexes | ➖ context only |
 
-**This README documents the Stories timeline pipeline** — the `embed → cluster →
-upload → Internet Archive → frontend` flow. The similarity-graph path is a parallel
-system with its own processor and its own Internet Archive layout; it is noted here
-only so that newcomers reading the frontend code aren't surprised to find a second
-data source. If you're working on the graph view, that path is out of scope for this
-document.
+This README covers the **Stories timeline** pipeline. The graph path is a parallel
+system with its own processor and layout; it's mentioned only so newcomers reading
+frontend code aren't surprised to find a second data source.
 
 ---
 
 ## Stage 1 — Embed
 
-Fetches articles from StoryGraph for a date range, generates sentence embeddings and
-topic classifications, and saves **one `.json.gz` file per day**.
+Pulls articles for a date range, generates sentence embeddings, topic labels, and NER
+entities. Writes **one `.json.gz` per day**.
 
 ```bash
-# Single day
-sgtk embed 2026-01-01 -p ./data/articles
-
-# Date range
 sgtk embed 2026-01-01 2026-01-31 -p ./data/articles
-
-# Custom embedding model
-sgtk embed 2026-01-01 2026-01-31 -p ./data/articles -m all-mpnet-base-v2
 ```
 
-**Options**
+Key flags: `-p` output path, `-m` model (default `all-MiniLM-L6-v2`).
+`cluster`, `probability`, and `representativeness` are `null` at this stage — Stage 2
+fills them in.
 
-| Option | Default | Meaning |
-|--------|---------|---------|
-| `start` | *(required)* | Start date, `YYYY-MM-DD` |
-| `end` | = `start` | End date, `YYYY-MM-DD` |
-| `-p, --path` | `.` | Where to write the embedded article files |
-| `-m, --model` | `all-MiniLM-L6-v2` | Sentence-Transformer model |
-
-**Output** — one array of article objects per day:
-
-```json
-[
-  {
-    "link": "https://example.com/article",
-    "title": "Article headline",
-    "text": "Full article text...",
-    "published": "2026-01-01T12:00:00Z",
-    "favicon": "https://example.com/favicon.ico",
-    "image": "https://example.com/image.jpg",
-    "embedding": [0.123, -0.456, "..."],
-    "embedding_model": "all-MiniLM-L6-v2",
-    "publisher": "nytimes",
-    "leaning": "left",
-    "topic": "Politics",
-    "entities": [
-      { "entity": "Joe Biden", "class": "PERSON" },
-      { "entity": "United States", "class": "GPE" }
-    ],
-    "cluster": null,
-    "probability": null,
-    "representativeness": null
-  }
-]
-```
-
-`cluster`, `probability`, and `representativeness` are `null` at this stage — they are
-filled in by the next stage.
+→ Full output schema, topic list, and NER classes: **StoryGraphToolkit README**.
 
 ---
 
 ## Stage 2 — Cluster
 
-Takes the embedded articles and clusters them with **HDBSCAN**. Produces **one flat
-`.json.gz` per interval window** containing *all* articles (including noise) with
-their cluster assignments and metadata. This flat file is exactly the shape the
-frontend consumes.
+Clusters the embedded articles with **HDBSCAN** into one flat `.json.gz` per interval
+window. Every article is kept, including noise (`cluster_id: null`). This flat file is
+exactly what the frontend consumes.
 
 ```bash
-# Single day
-sgtk cluster 2026-01-15 days -s ./data/articles -p ./data/timeline
-
-# Date range
 sgtk cluster 2026-01-01 2026-01-31 days -s ./data/articles -p ./data/timeline
-
-# Week (date is automatically normalized to the Monday of that week)
-sgtk cluster 2026-01-15 weeks -s ./data/articles -p ./data/timeline
-
-# Month (normalized to the first of the month)
-sgtk cluster 2026-01-01 months -s ./data/articles -p ./data/timeline
-
-# Override HDBSCAN tuning
-sgtk cluster 2026-01-15 days -s ./data/articles -p ./data/timeline \
-  --min-cluster-size 4 --min-samples 4
 ```
 
-**Options**
+`interval` is required and **plural**: `days | weeks | months | years`. Week dates
+normalize to the Monday of that ISO week, months to the 1st, years to Jan 1.
 
-| Option | Default | Meaning |
-|--------|---------|---------|
-| `start` | *(required)* | Start date, `YYYY-MM-DD` |
-| `end` | = `start` | End date, `YYYY-MM-DD` |
-| `interval` | *(required)* | `days` \| `weeks` \| `months` \| `years` |
-| `-s, --source` | `.` | Folder of embedded articles (Stage 1 output) |
-| `-p, --path` | `.` | Where to write the flat timeline files |
-| `--min-cluster-size` | *(see below)* | HDBSCAN tuning |
-| `--min-samples` | *(see below)* | HDBSCAN tuning |
-
-**Default HDBSCAN parameters per interval**
-
-| Interval | `min_cluster_size` | `min_samples` |
-|----------|--------------------|---------------|
-| days | 2 | 2 |
-| weeks | 2 | 2 |
-| months | 4 | 4 |
-| years | 5 | 5 |
-
-**Output file layout**
+**Output layout** (the shape Stage 3 expects):
 
 ```
 data/timeline/
-├── days/
-│   ├── 2026-01-01.json.gz
-│   ├── 2026-01-02.json.gz
-│   └── ...
-├── weeks/
-│   └── 2026-01-05.json.gz   ← named by the Monday of that week
-├── months/
-│   └── 2026-01-01.json.gz
-└── years/
-    └── 2026-01-01.json.gz
+├── days/    2026-01-01.json.gz
+├── weeks/   2026-01-05.json.gz   ← Monday of that week
+├── months/  2026-01-01.json.gz
+└── years/   2026-01-01.json.gz
 ```
 
-**Output format** — a single object with a `params` block and a flat `articles`
-array. Every article is present; noise articles carry `cluster_id: null`.
+Each file is `{ params, articles[] }`. The two fields that matter most downstream:
+`cluster_id` (groups articles into a story; `null` = noise, dropped by the frontend)
+and `representativeness` (highest-scoring article in a cluster becomes its label).
 
-```json
-{
-  "params": {
-    "total_left": 50,
-    "total_center": 40,
-    "total_right": 25,
-    "noise_articles": 18,
-    "total_articles_processed": 133,
-    "date": "2026-01-01",
-    "time_interval": "days"
-  },
-  "articles": [
-    {
-      "cluster_id": 3,
-      "topic": "Crime & Public Safety",
-      "representativeness": 0.95,
-      "entities": [
-        { "entity": "Donald Trump", "class": "PERSON" },
-        { "entity": "New Orleans", "class": "GPE" }
-      ],
-      "title": "Article headline",
-      "published": "Wed, 01 Jan 2026 18:40:36 +0000",
-      "favicon": "https://example.com/favicon.ico",
-      "link": "https://example.com/article",
-      "image": "https://example.com/image.jpg",
-      "leaning": "left",
-      "publisher": "nytimes"
-    }
-  ]
-}
-```
-
-**Field notes**
-
-- `cluster_id` — HDBSCAN cluster integer. `null` = noise (didn't fit any cluster) and
-  is excluded from Stories mode in the frontend.
-- `representativeness` — cosine similarity to the cluster medoid, `[0, 1]`. The
-  highest-scoring article in a cluster is used as that cluster's headline label.
-  `null` for noise.
-- `topic` — always present. One of the 15 classifier labels (see reference below).
-- `entities` — filtered NER tags. One article can land in multiple entity groups.
-  Empty list if none.
-- `publisher` — domain root without TLD (e.g. `nytimes`, not `nytimes.com`).
-- `params.total_*` counts include noise.
-
-**Python API** (equivalent to the CLI, if you'd rather script it):
-
-```python
-from storygraph_tk import generate_embedded_articles, generate_cluster_data_range
-
-generate_embedded_articles("2026-01-01", "2026-01-31", output_dir="./data/articles")
-generate_cluster_data_range(
-    "2026-01-01", "2026-01-31",
-    interval="days",
-    output_folder="./data/timeline",
-    source="./data/articles",
-)
-```
+→ Full schema, field notes, and default HDBSCAN parameters per interval:
+**StoryGraphToolkit README**.
 
 ---
 
 ## Stage 3 — Upload to the Internet Archive
 
-The clustered flat files from Stage 2 are the frontend's production data source. For
-the **deployed** site to see them, they are published to the Internet Archive by
-`ia_uploader.py`; the frontend then fetches them directly from there (no application
-server sits in the production path — see [Local development](#local-development) for
-the dev-only server).
-
-### Running the upload
+`ia_uploader.py` publishes the Stage 2 files. This is the glue step — its conventions
+aren't documented in either repo, so they're spelled out here.
 
 ```bash
-python3 ia_uploader.py <interval>     # interval: day | week | month | year  (SINGULAR)
+python3 ia_uploader.py <interval>    # day | week | month | year  — SINGULAR
 ```
 
-The uploader walks a date range, and for each interval-aligned date it uploads the
-matching flat file to the Internet Archive in parallel (a `ThreadPoolExecutor` with
-10 workers; each upload retries up to 5 times with a 10 s backoff). Missing source
-files are skipped with a warning rather than failing the run.
+Uploads run in parallel (10 workers, 5 retries with 10 s backoff). Missing source
+files are skipped, not fatal.
 
-> **The date range is hardcoded, not a CLI argument.** In `__main__` the script calls
-> `upload_date_range(interval, '2017-08-08', '2026-04-30')`, so an out-of-the-box run
-> re-processes that entire span for the chosen interval. To upload a different range,
-> edit those literals or call `upload_date_range(interval, start, end)` yourself. The
-> start date is auto-snapped to the interval boundary (Monday for weeks, the 1st for
-> months, Jan 1 for years).
+**Reads from `./tmp`** — `SRC_BASE` is hardcoded, so run `sgtk cluster -p ./tmp` (or
+move/symlink the output there) or every file is skipped as missing.
 
-### Where it reads from
+**Writes to per-month items**, renaming files on the way up:
 
-`SRC_BASE` is hardcoded to **`./tmp`**, and the uploader expects the same
-per-interval directory layout that `sgtk cluster` produces. **Point `sgtk cluster` at
-`./tmp`** (`-p ./tmp`) — or move/symlink its output there — so the files line up:
-
-| Interval | Source file the uploader reads |
-|----------|--------------------------------|
-| day | `./tmp/days/YYYY-MM-DD.json.gz` |
-| week | `./tmp/weeks/YYYY-MM-DD.json.gz` (Monday of the ISO week) |
-| month | `./tmp/months/YYYY-MM-01.json.gz` |
-| year | `./tmp/years/YYYY-01-01.json.gz` |
-
-Note the split naming convention: the **CLI argument and the directory names** differ
-(singular `day` on the command line vs. plural `days/` on disk). This matches
-`sgtk cluster`'s plural output folders.
-
-### Where it writes to (Internet Archive layout)
-
-Every file lands in a **per-month item** named `storygraph-data-usa-YYYY-MM`
-(collection `storygraph`, `mediatype: data`). **Files are renamed on upload** — the
-in-item object key is *not* the bare date used on disk, but a `stories-{interval}-…`
-name under a day-of-month folder:
-
-| Interval | Internet Archive item | In-item path (object key) |
-|----------|-----------------------|---------------------------|
+| Interval | Item | In-item path |
+|----------|------|--------------|
 | day | `storygraph-data-usa-YYYY-MM` | `DD/stories-day-YYYY-MM-DD.json.gz` |
-| week | `storygraph-data-usa-YYYY-MM` | `DD/stories-week-YYYY-MM-wWW.json.gz` (`DD` = Monday, `WW` = ISO week) |
+| week | `storygraph-data-usa-YYYY-MM` | `DD/stories-week-YYYY-MM-wWW.json.gz` |
 | month | `storygraph-data-usa-YYYY-MM` | `01/stories-month-YYYY-MM.json.gz` |
 | year | `storygraph-data-usa-YYYY-01` | `01/stories-year-YYYY.json.gz` |
 
-So a given month's item can hold that month's daily files, its weekly files, and the
-monthly rollup side by side. Year rollups live in that year's **January** item
-(`…-YYYY-01`). This is the same item convention the separate similarity-graph pipeline
-uses (`storygraph-data-usa-YYYY-MM/DD/graphs-*.jsonl.gz`), so both tools' data coexist
-under one family of items.
+Collection `storygraph`, `mediatype: data`. A month's item holds its daily, weekly,
+and monthly files side by side; year rollups live in that year's January item.
 
-### Credentials
+**Credentials** come from the `internetarchive` library's standard auth — run
+`ia configure` once, or set `IA_ACCESS_KEY` / `IA_SECRET_KEY`.
 
-The script uses the [`internetarchive`](https://archive.org/developers/internetarchive/)
-Python library's `upload()` and does **not** set keys itself, so it relies on that
-library's standard authentication — run `ia configure` once (writes
-`~/.config/internetarchive/ia.ini`) or set the `IA_ACCESS_KEY` / `IA_SECRET_KEY`
-environment variables before running. Uploads write to the `storygraph` collection and
-are attributed to the `uploader` in the script's metadata block; publishing to that
-collection requires an account with permission to do so.
-
-### Dry run
-
-`upload_helper()` accepts an `ia_no_upload` flag that prints intended uploads instead
-of performing them. The interval branches currently pass `ia_no_upload=False`; flip it
-(or thread it through from the CLI) if you want to preview what a run would push
-without touching the Archive.
+> **The date range is hardcoded.** `__main__` calls
+> `upload_date_range(interval, '2017-08-08', '2026-04-30')`. Edit those literals or
+> call `upload_date_range()` directly for a different span. `upload_helper()` also
+> takes an `ia_no_upload` flag for dry runs.
 
 ---
 
-## Stage 4 — Frontend: fetch, filter, display
+## Stage 4 — Frontend
 
-The frontend is a **React + TypeScript** app built with **Vite**, with visualizations
-in **D3**. Once it has a flat file, *all* remaining work happens in the browser —
-switching view modes or bucket sizes recomputes derived data from state and makes **no
-new network request**.
+React + TypeScript (Vite), visualizations in D3. It fetches one flat file, then does
+**everything else in the browser** — changing view mode or bucket size recomputes from
+state and makes no new request.
 
-### Fetch
+```
+flat file ──▶ applyGroupingStrategy() ──▶ parseStoryItems() ──▶ D3 chart
+              group by story/topic/       sort, filter, slice    line per group
+              entity                                             circle per bucket
+```
 
-Timeline data is loaded by `getFlatDataForDate()` in `src/requests.ts`, keyed by
-`{interval}/{date}`. In production this resolves to the Internet Archive copy of the
-flat file published in Stage 3; in local development it points at the dev server
-(below). The production file for a given interval/date lives at the Internet Archive
-download URL that mirrors the uploader's layout:
+**Fetch** — `getFlatDataForDate()` in `src/requests.ts`, keyed by `{interval}/{date}`,
+resolving to the Archive URLs from Stage 3:
 
 ```
 https://archive.org/download/storygraph-data-usa-YYYY-MM/DD/stories-day-YYYY-MM-DD.json.gz
-https://archive.org/download/storygraph-data-usa-YYYY-MM/DD/stories-week-YYYY-MM-wWW.json.gz
-https://archive.org/download/storygraph-data-usa-YYYY-MM/01/stories-month-YYYY-MM.json.gz
-https://archive.org/download/storygraph-data-usa-YYYY-01/01/stories-year-YYYY.json.gz
 ```
 
-> **One thing to verify in `src/requests.ts`:** the fetch target as documented in the
-> frontend still shows the local dev address (`http://127.0.0.1:5000/api/timeline/...`).
-> Confirm the production build points at the Internet Archive URLs above (typically via
-> a base-URL env var / build config) and that it requests the **renamed**
-> `stories-{interval}-…` object keys — not the bare `YYYY-MM-DD.json.gz` names used on
-> disk before upload.
+Both plain and gzipped JSON are accepted (decompression is tried first).
 
-The frontend accepts **both** plain JSON and gzip-compressed JSON — it attempts
-decompression first and falls back to raw text. Serving gzipped files is recommended,
-especially for year-level windows.
+**Grouping** — three modes over the same data: **stories** (by `cluster_id`), **topics**
+(by `topic` string), **entities** (explodes `entities[]`, so one article can feed
+several groups).
 
-### Filter and order
+**Ordering and visibility**, in order: sort by total article count → drop groups below
+the diversity minimum (normalized Shannon entropy of the publisher mix, default 0.05)
+→ grey out groups under the threshold → keep only the top 15 (50 for entities).
 
-Once the flat `FlatFileData` arrives, the browser turns it into chart lines:
-
-```
-FlatFileData (raw articles)
-    │  applyGroupingStrategy(data, mode, bucketHours)
-    ▼
-StoryItem[]        one item per story / topic / entity
-    │  parseStoryItems(items, view, diversity, maxStories)
-    ▼
-TimelineData[]     one point per time bucket per group
-    │
-    ▼
-D3 chart           one line per group, one circle per bucket
-```
-
-**Grouping modes** (same raw data, three strategies):
-
-- **Stories** — group by `cluster_id`; the highest-`representativeness` article in each
-  cluster becomes the label. Noise (`cluster_id: null`) is dropped.
-- **Topics** — group by the `topic` string; label is the topic name.
-- **Entities** — explode each article's `entities[]` so one article can feed several
-  groups; label is the entity name. Top 50 entities by article count are kept.
-
-**Ordering and visibility**, applied in this order:
-
-1. **Sort** every group by total article count, descending (most-covered first — this
-   also drives legend order and color assignment).
-2. **Diversity filter** — hide any group whose publisher-diversity score is below the
-   slider minimum (default `0.05`). Diversity is the normalized Shannon entropy of the
-   group's publisher distribution: `0` = single outlet, `1` = every article from a
-   different outlet.
-3. **Threshold** — a default threshold (the peak count of the *Nth* story for the
-   interval) greys out and pushes below the line any group that never clears it;
-   overridable via a stepper.
-4. **Slice** — only the top **15** stories (top **50** for entities) are drawn at all.
-
-**Time bucketing** — every article is snapped to a bucket boundary before counting.
-Day/sub-week buckets snap on an epoch grid; weekly and multi-week buckets snap to the
-Monday of the article's ISO week. Empty buckets are zero-padded so a line that goes
-quiet drops to zero rather than skipping points. Bucket size is user-selectable and
-stored in the URL.
-
-**Shareable state** — all interactive state (interval, date, view mode, threshold,
-diversity, bucket index, visible leanings, highlighted lines, colors, legend
-visibility) is encoded in the URL, so any view can be bookmarked or shared. See the
-frontend repo for the full parameter table.
-
-### Run the frontend
+All interactive state is encoded in the URL, so any view is shareable.
 
 ```bash
-npm install
-npm run dev        # dev server at http://localhost:5173
+npm install && npm run dev     # http://localhost:5173
+docker-compose up --build      # production build, port 80
 ```
 
-Production build (Docker + nginx, serves on port 80):
+→ File map, URL parameters, bucketing math, and how to add a view mode:
+**frontend README**.
+
+---
+
+## Running on the HPC cluster (`2017_to_2026/`)
+
+Backfilling the full archive is far too slow to run interactively, so `2017_to_2026/`
+holds a set of **Slurm batch scripts** that run the pipeline on the HPC cluster.
+
+Submit with `sbatch`:
 
 ```bash
-docker-compose up --build
+cd 2017_to_2026/
+sbatch <script>.slurm
+squeue -u $USER        # check status
 ```
 
-The deployed site is hosted through W&M IT and released via a GitHub Action that fires
-when `main` updates.
+These wrap the same `sgtk` commands documented above — the stage semantics, intervals,
+and output layout are identical; only the execution environment differs. Because the
+uploader reads from `./tmp`, make sure the cluster jobs write their cluster output
+where the upload step will look for it (or stage it there afterwards).
+
+> **Fill in per script:** what each script covers (stage and date span), the partition
+> / time / memory it requests, and where its logs and output land. Also note any module
+> loads or virtualenv activation needed for `sgtk` on the cluster.
 
 ---
 
 ## Local development
 
-Running the *whole* pipeline on your machine, without touching the Internet Archive:
+Run the whole thing without touching the Internet Archive:
 
-1. **Generate data locally**
+1. Generate data — `sgtk embed …` then `sgtk cluster … -p ./data/timeline`.
+2. Serve it with the local dev server on **port 5000**, which exposes
+   `GET /api/timeline/{days|weeks|months|years}/{YYYY-MM-DD}` and returns the matching
+   flat file. Months always use `dd=01`, years `mm=01&dd=01`.
+3. Point the frontend at it and `npm run dev`.
 
-   ```bash
-   sgtk embed   2026-01-01 2026-01-07 -p ./data/articles
-   sgtk cluster 2026-01-01 2026-01-07 days -s ./data/articles -p ./data/timeline
-   ```
-
-2. **Serve the flat files with the local dev server.** In production the frontend
-   reads flat files from the Internet Archive. For local development there is instead
-   a small HTTP server (the "port-5000 server") that serves the contents of
-   `./data/timeline/` to the frontend. **This server is a development convenience /
-   stand-in for the Internet Archive — it is not part of the production data path.**
-
-   It exposes four endpoints, one per interval, each returning the matching flat file
-   (plain or gzipped JSON):
-
-   | Endpoint | Date format | Covers |
-   |----------|-------------|--------|
-   | `GET /api/timeline/days/YYYY-MM-DD` | exact day | 24 hours |
-   | `GET /api/timeline/weeks/YYYY-MM-DD` | Monday of the ISO week | 7 days |
-   | `GET /api/timeline/months/YYYY-MM-01` | first of month | full month |
-   | `GET /api/timeline/years/YYYY-01-01` | first of year | full year |
-
-   For months the frontend always sends `dd=01`; for years `mm=01&dd=01`.
-
-   > **Note:** an implementation of this dev server is not included in the two core
-   > repositories described here. If your team maintains one, link it and its run
-   > command in this section. If not, any static file server that maps the four routes
-   > above onto `./data/timeline/{interval}/{date}.json.gz` will work.
-
-3. **Point the frontend at the dev server** (the default `127.0.0.1:5000` target in
-   `src/requests.ts`) and run `npm run dev`.
+> This server is a **development stand-in for the Internet Archive** — it is not part
+> of the production path and shouldn't be treated as a runtime dependency. No
+> implementation ships in the repos above; any static server mapping those four routes
+> onto `./data/timeline/{interval}/{date}.json.gz` works.
 
 ---
 
-## Reference tables
+## Gotchas
 
-### Topic categories (15)
+- **`ia_uploader.py` reads `./tmp`, not `./data/timeline`.** Hardcoded `SRC_BASE`.
+  Mismatch = every file silently skipped as missing.
+- **Singular vs. plural `interval`.** Uploader CLI and uploaded filenames are singular
+  (`day`, `stories-day-…`); directories, `sgtk cluster`, and frontend routes are plural
+  (`days/`). Most likely source of "file not found."
+- **Files are renamed on upload.** `2026-01-01.json.gz` on disk becomes
+  `stories-day-2026-01-01.json.gz` in the Archive. Fetchers must use the latter.
+- **The uploader's date range is hardcoded**, with no CLI date argument.
+- **`published` timestamp format is inconsistent in the docs** — ISO 8601 out of embed,
+  RFC-822-style in the cluster example, ISO 8601 expected by the frontend. Worth
+  confirming; a mismatch silently breaks bucketing.
+- **Week dates normalize to Monday** everywhere — pass the Monday, not an arbitrary day.
+- **Two data sources, one frontend.** Timeline and similarity graph are independent;
+  changing one doesn't affect the other.
 
-Assigned by the `sleong105/news-classifier` model; every article gets exactly one.
-
-| Topics | | |
-|--------|--------|--------|
-| Crime & Public Safety | Health | Education |
-| Transportation | Environment & Weather | Economy & Business |
-| Politics | Government & Public Services | Housing |
-| Social Welfare | Arts & Entertainment | Sports |
-| Science & Technology | Lifestyle | Other |
-
-### NER entity classes (kept)
-
-All other classes (`DATE`, `TIME`, `CARDINAL`, `ORDINAL`, `MONEY`, `PERCENT`,
-`QUANTITY`, `WORK_OF_ART`, `LAW`, `LANGUAGE`, `TOP_10_TERM`, `TITLE`) are filtered out.
-
-| Class | Description | Examples |
-|-------|-------------|----------|
-| `PERSON` | Named people | "Donald Trump", "Elon Musk" |
-| `GPE` | Countries, cities, states | "United States", "California" |
-| `ORG` | Companies, agencies, institutions | "FBI", "Congress" |
-| `NORP` | Nationalities, political/religious groups | "Republicans", "Americans" |
-| `LOC` | Non-GPE geographic locations | "Chapel Hill", "Atlantic Ocean" |
-| `EVENT` | Named events | "Super Bowl", "New Year's Day" |
-| `FAC` | Facilities, buildings | "The Pentagon", "LAX" |
-| `PRODUCT` | Objects, vehicles, software | "Substack", "Tesla" |
-
-### Political leaning
-
-Every article's `leaning` is one of `left`, `center`, `right`.
-
-### Frontend defaults
-
-| Setting | Default |
-|---------|---------|
-| Max stories drawn | 15 |
-| Max entities drawn | 50 |
-| Diversity minimum | 0.05 (shown as 5%) |
-| Default bucket — Day / Week / Month / Year | 2 h / 1 day / 1 day / 2 weeks |
-| Threshold top-N — Day / Week / Month·Year | 3 / 4 / 5 |
-
+---
 
 ## Repositories
 
 - **StoryGraphToolkit** (`sgtk` — embed + cluster) —
   <https://github.com/oduwsdl/storygraph-toolkit>
-  Branch with stories changes <https://github.com/sleong05/storygraph-toolkit> (still needs to be merged in)
+  Branch with the stories changes: <https://github.com/sleong05/storygraph-toolkit>
+  *(still needs to be merged in)*
   ```bash
   git clone https://github.com/oduwsdl/storygraph-toolkit.git
   cd storygraph-toolkit/ && pip install . && cd .. && rm -rf storygraph-toolkit/
   ```
-- **`ia_uploader.py`** (Stage 3 — publishes flat files to the Internet Archive) —
-  standalone script; depends on the [`internetarchive`](https://archive.org/developers/internetarchive/)
-  Python library (`pip install internetarchive`, then `ia configure`).
+- **`ia_uploader.py`** — Stage 3, standalone script. Needs
+  [`internetarchive`](https://archive.org/developers/internetarchive/)
+  (`pip install internetarchive`, then `ia configure`).
+- **`2017_to_2026/`** — Slurm batch scripts for running the pipeline on the HPC cluster.
 - **StoryGraph frontend** (React/TS/Vite/D3) —
   `https://code.wm.edu/data-science/news-lab/storygraph`
 - **Live site** — <https://newsresearch.lab.wm.edu/tools/storygraph/>
