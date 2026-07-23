@@ -529,6 +529,7 @@ Every article's `leaning` is one of `left`, `center`, `right`.
 
 - **StoryGraphToolkit** (`sgtk` — embed + cluster) —
   <https://github.com/oduwsdl/storygraph-toolkit>
+  Branch with stories changes <https://github.com/sleong05/storygraph-toolkit> (still needs to be merged in)
   ```bash
   git clone https://github.com/oduwsdl/storygraph-toolkit.git
   cd storygraph-toolkit/ && pip install . && cd .. && rm -rf storygraph-toolkit/
